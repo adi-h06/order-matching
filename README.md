@@ -13,15 +13,15 @@ Both insertion and cancellation of orders are O(1).
 
 100,000 orders were processed in 15 milliseconds. 
 
-- 19996 Market orders
-- 80004 Limit orders
+- 19,996 Market orders
+- 80,004 Limit orders
 - Best bid: $100.05
 - Best ask: $100.32
 - Spread: 0.27
 - Total trades: 91,845
 - Total volume: 1,134,320
 - VWAP: $99.98
-- 1020 orders cancelled
+- 1,020 orders cancelled
 - Remaining resting orders: 4,849
 
 ## Assumptions
