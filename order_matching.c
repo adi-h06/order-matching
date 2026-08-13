@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include <time.h>
 
+#define HASH_SIZE 4096
+#define SIZE 100000
+
 typedef struct Order {
     int id;
     char side;
@@ -9,12 +12,16 @@ typedef struct Order {
     int qty;
     int is_market;
     struct Order *next;
+    struct Order *prev;
+    struct PriceLvl *lvl;
 } Order;
 
 typedef struct PriceLvl {
     double price;
     Order *first_order;
+    Order *last_order;
     struct PriceLvl *next;
+    struct PriceLvl *prev;
 } PriceLvl;
 
 typedef struct Trade {
@@ -32,6 +39,60 @@ typedef struct OrderSpec {
     int is_market;
 } OrderSpec;
 
+typedef struct HashEntry {
+    int id;
+    Order *order;
+    struct HashEntry *next;
+} HashEntry;
+
+HashEntry *order_index[HASH_SIZE];
+
+int hash_id(int id)
+{
+    return ((unsigned int)id) % HASH_SIZE;
+}
+
+void hash_insert(int id, Order *order)
+{
+    int idx = hash_id(id);
+    HashEntry *node = malloc(sizeof(HashEntry));
+    node->id = id;
+    node->order = order;
+    node->next = order_index[idx];
+    order_index[idx] = node;
+}
+
+Order *hash_lookup(int id)
+{
+    int idx = hash_id(id);
+    HashEntry *node = order_index[idx];
+    while (node != NULL)
+    {
+        if (node->id == id) return node->order;
+        node = node->next;
+    }
+    return NULL;
+}
+
+void hash_remove(int id)
+{
+    int idx = hash_id(id);
+    HashEntry *node = order_index[idx];
+    HashEntry *prev = NULL;
+    while (node != NULL)
+    {
+        if (node->id == id)
+        {
+            if (prev == NULL) order_index[idx] = node->next;
+            else prev->next = node->next;
+            free(node);
+            return;
+        }
+        prev = node;
+        node = node->next;
+    }
+}
+
 Order *create_order(int id, char side, double price, int qty, int is_market) {
     Order *new_order = malloc(sizeof(Order));
     new_order->id = id;
@@ -40,24 +101,27 @@ Order *create_order(int id, char side, double price, int qty, int is_market) {
     new_order->qty = qty;
     new_order->is_market = is_market;
     new_order->next = NULL;
+    new_order->prev = NULL;
+    new_order->lvl = NULL;
     return new_order;
 }
 
 void add_order_to_lvl(PriceLvl *lvl, Order *new_order)
 {
+    new_order->lvl = lvl;
     if (lvl->first_order == NULL)
     {
         lvl->first_order = new_order;
+        lvl->last_order = new_order;
+        new_order->prev = NULL;
     }
     else
     {
-        Order *curr = lvl->first_order;
-        while (curr->next != NULL)
-        {
-            curr = curr->next;
-        }
-        curr->next = new_order;
+        lvl->last_order->next = new_order;
+        new_order->prev = lvl->last_order;
+        lvl->last_order = new_order;
     }
+    hash_insert(new_order->id, new_order);
 }
 
 PriceLvl *find_or_create_lvl(PriceLvl **first_ptr, double price, char side)
@@ -80,7 +144,9 @@ PriceLvl *find_or_create_lvl(PriceLvl **first_ptr, double price, char side)
     PriceLvl *new_level = malloc(sizeof(PriceLvl));
     new_level->price = price;
     new_level->first_order = NULL;
+    new_level->last_order = NULL;
     new_level->next = curr;
+    new_level->prev = prev;
 
     if (prev == NULL)
     {
@@ -91,13 +157,17 @@ PriceLvl *find_or_create_lvl(PriceLvl **first_ptr, double price, char side)
         prev->next = new_level;
     }
 
+    if (curr != NULL)
+    {
+        curr->prev = new_level;
+    }
+
     return new_level;
 }
 
 int match_order(Order *inc, PriceLvl **first_opp, char side, Trade trades[], int *trade_ct)
 {
     PriceLvl *best = *first_opp;
-    PriceLvl *prev_lvl = NULL;
 
     while (best != NULL && inc->qty > 0)
     {
@@ -123,9 +193,18 @@ int match_order(Order *inc, PriceLvl **first_opp, char side, Trade trades[], int
 
             if (rem->qty == 0)
             {
-                best->first_order = rem->next;
-                free(rem);
-                rem = best->first_order;
+                Order *to_remove = rem;
+                Order *next_order = rem->next;
+
+                if (to_remove->prev == NULL) best->first_order = next_order;
+                else to_remove->prev->next = next_order;
+
+                if (next_order == NULL) best->last_order = to_remove->prev;
+                else next_order->prev = to_remove->prev;
+
+                hash_remove(to_remove->id);
+                free(to_remove);
+                rem = next_order;
             }
             else
             {
@@ -136,20 +215,19 @@ int match_order(Order *inc, PriceLvl **first_opp, char side, Trade trades[], int
         if (best->first_order == NULL)
         {
             PriceLvl *empty_lvl = best;
-            if (prev_lvl == NULL)
-            {
-                *first_opp = best->next;
-            }
-            else
-            {
-                prev_lvl->next = best->next;
-            }
-            best = best->next;
+            PriceLvl *before = empty_lvl->prev;
+            PriceLvl *after = empty_lvl->next;
+
+            if (before == NULL) *first_opp = after;
+            else before->next = after;
+
+            if (after != NULL) after->prev = before;
+
+            best = after;
             free(empty_lvl);
         }
         else
         {
-            prev_lvl = best;
             best = best->next;
         }
     }
@@ -193,54 +271,44 @@ void add_order(Order *new_order, PriceLvl **bids, PriceLvl **asks, Trade trades[
     }
 }
 
-int cancel_order(int id, PriceLvl **book, char side)
+int cancel_order(int id, PriceLvl **bids, PriceLvl **asks)
 {
-    PriceLvl *lvl = *book;
-    PriceLvl *prev_lvl = NULL;
+    Order *target = hash_lookup(id);
+    if (target == NULL) return 0;
 
-    while (lvl != NULL)
+    char side = target->side;
+    PriceLvl *lvl = target->lvl;
+
+    if (target->prev == NULL) lvl->first_order = target->next;
+    else target->prev->next = target->next;
+
+    if (target->next == NULL) lvl->last_order = target->prev;
+    else target->next->prev = target->prev;
+
+    hash_remove(id);
+    free(target);
+
+    if (lvl->first_order == NULL)
     {
-        Order *ord = lvl->first_order;
-        Order *prev_ord = NULL;
+        PriceLvl *before = lvl->prev;
+        PriceLvl *after = lvl->next;
 
-        while (ord != NULL)
+        if (before == NULL)
         {
-            if (ord->id == id)
-            {
-                if (prev_ord == NULL)
-                {
-                    lvl->first_order = ord->next;
-                }
-                else
-                {
-                    prev_ord->next = ord->next;
-                }
-                free(ord);
-
-                if (lvl->first_order == NULL)
-                {
-                    if (prev_lvl == NULL)
-                    {
-                        *book = lvl->next;
-                    }
-                    else
-                    {
-                        prev_lvl->next = lvl->next;
-                    }
-                    free(lvl);
-                }
-
-                return 1;
-            }
-            prev_ord = ord;
-            ord = ord->next;
+            if (side == 'B') *bids = after;
+            else *asks = after;
+        }
+        else
+        {
+            before->next = after;
         }
 
-        prev_lvl = lvl;
-        lvl = lvl->next;
+        if (after != NULL) after->prev = before;
+
+        free(lvl);
     }
 
-    return 0;
+    return 1;
 }
 
 void print_results(Trade trades[], int trade_ct)
@@ -321,12 +389,12 @@ int main(void)
 
     PriceLvl *bids = NULL;
     PriceLvl *asks = NULL;
-    Trade trades[10000];
+    Trade *trades = malloc(SIZE * sizeof(Trade));
     int trade_ct = 0;
     int cancels_successful = 0;
     int market_order_ct = 0;
 
-    int num_orders = 10000;
+    int num_orders = SIZE;
 
     clock_t start = clock();
 
@@ -340,7 +408,7 @@ int main(void)
         if (rand() % 100 == 0 && bids != NULL)
         {
             int canceled_id = bids->first_order->id;
-            int result = cancel_order(canceled_id, &bids, 'B');
+            int result = cancel_order(canceled_id, &bids, &asks);
             if (result) cancels_successful++;
         }
     }
@@ -362,6 +430,8 @@ int main(void)
     printf("\n");
     print_results(trades, trade_ct);
     printf("Orders canceled: %d\n", cancels_successful);
+
+    free(trades);
 
     return 0;
 }
